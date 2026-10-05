@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Events\VehiclePositionUpdated;
 use App\Models\Device;
 use App\Models\GpsPosition;
+use App\Services\Telemetry\TelemetryNormalizer;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -30,29 +31,59 @@ class ProcessGpsBatchJob implements ShouldQueue
         public readonly array $batch,
     ) {}
 
-    public function handle(): void
+    public function handle(TelemetryNormalizer $normalizer): void
     {
         $now = Carbon::now();
 
-        // ── 1. Normalize all dot-notation records ──────────────────────
-        $normalized = array_map(fn (array $raw) => $this->normalize($raw), $this->batch);
+        // ── 1. Normalize all records (handles Flespi dotted, nested, or snake_case) ──
+        $normalized = array_values(array_filter(
+            array_map(fn (array $raw) => $normalizer->normalizeRecord($raw), $this->batch),
+            fn (array $item) => !empty($item['ident']) && $item['position_latitude'] !== null && $item['position_longitude'] !== null
+        ));
 
-        // ── 2. Bulk upsert devices (update last-known state) ───────────
-        $deviceRows = [];
+        if (empty($normalized)) {
+            return;
+        }
+
+        // ── 2. Deduplicate devices per ident (use most recent telemetry state) ──
+        // This avoids SQL unique constraint/cardinality violations on multi-row upserts
+        $latestByDevice = [];
         foreach ($normalized as $record) {
+            $ident = (string) $record['ident'];
+            if (!isset($latestByDevice[$ident]) || ($record['timestamp'] >= $latestByDevice[$ident]['timestamp'])) {
+                $latestByDevice[$ident] = $record;
+            }
+        }
+
+        $idents = array_keys($latestByDevice);
+
+        // Preload existing device names to avoid overwriting them with null
+        $existingDevices = Device::whereIn('ident', $idents)
+            ->get(['id', 'ident', 'name'])
+            ->keyBy('ident');
+
+        $deviceRows = [];
+        foreach ($latestByDevice as $ident => $record) {
+            $existing = $existingDevices->get($ident);
+            $deviceName = !empty($record['device_name'])
+                ? $record['device_name']
+                : ($existing?->name ?? ('Vehicle ' . substr($ident, -4)));
+
+            $recordedAt = isset($record['timestamp'])
+                ? Carbon::createFromTimestamp($record['timestamp'])
+                : $now;
+
             $deviceRows[] = [
-                'ident'           => $record['ident'],
-                'name'            => $record['device_name'] ?? null,
-                'last_latitude'   => $record['position_latitude'] ?? null,
-                'last_longitude'  => $record['position_longitude'] ?? null,
+                'ident'           => $ident,
+                'name'            => $deviceName,
+                'last_latitude'   => $record['position_latitude'],
+                'last_longitude'  => $record['position_longitude'],
                 'last_speed'      => $record['position_speed'] ?? 0,
                 'last_direction'  => $record['position_direction'] ?? 0,
-                'engine_ignition' => $record['engine_ignition_status'] ?? false,
-                'movement_status' => $record['movement_status'] ?? false,
+                'engine_ignition' => (bool) ($record['engine_ignition_status'] ?? false),
+                'movement_status' => (bool) ($record['movement_status'] ?? false),
                 'mileage'         => $record['vehicle_mileage'] ?? 0,
-                'last_seen_at'    => isset($record['timestamp'])
-                    ? Carbon::createFromTimestamp($record['timestamp'])
-                    : $now,
+                'last_seen_at'    => $recordedAt,
                 'updated_at'      => $now,
                 'created_at'      => $now,
             ];
@@ -75,32 +106,34 @@ class ProcessGpsBatchJob implements ShouldQueue
             ],
         );
 
-        // ── 3. Map idents → device IDs (single query) ─────────────────
-        $idents = array_unique(array_column($deviceRows, 'ident'));
+        // ── 3. Map idents → Device IDs in a single query ───────────────────────
         $deviceMap = Device::whereIn('ident', $idents)
             ->pluck('id', 'ident')
             ->toArray();
 
-        // ── 4. Bulk insert GPS positions (historical breadcrumbs) ──────
+        // ── 4. Bulk insert GPS positions (historical breadcrumbs) ───────────────
         $positionRows = [];
         foreach ($normalized as $record) {
-            $deviceId = $deviceMap[$record['ident']] ?? null;
+            $ident = (string) $record['ident'];
+            $deviceId = $deviceMap[$ident] ?? null;
             if (!$deviceId) {
                 continue;
             }
 
+            $recordedAt = isset($record['timestamp'])
+                ? Carbon::createFromTimestamp($record['timestamp'])
+                : $now;
+
             $positionRows[] = [
                 'device_id'       => $deviceId,
-                'latitude'        => $record['position_latitude'] ?? 0,
-                'longitude'       => $record['position_longitude'] ?? 0,
+                'latitude'        => $record['position_latitude'],
+                'longitude'       => $record['position_longitude'],
                 'speed'           => $record['position_speed'] ?? 0,
                 'direction'       => $record['position_direction'] ?? 0,
                 'altitude'        => $record['position_altitude'] ?? 0,
-                'engine_ignition' => $record['engine_ignition_status'] ?? false,
-                'movement_status' => $record['movement_status'] ?? false,
-                'recorded_at'     => isset($record['timestamp'])
-                    ? Carbon::createFromTimestamp($record['timestamp'])
-                    : $now,
+                'engine_ignition' => (bool) ($record['engine_ignition_status'] ?? false),
+                'movement_status' => (bool) ($record['movement_status'] ?? false),
+                'recorded_at'     => $recordedAt,
                 'created_at'      => $now,
                 'updated_at'      => $now,
             ];
@@ -111,31 +144,34 @@ class ProcessGpsBatchJob implements ShouldQueue
             GpsPosition::insert($chunk);
         }
 
-        // ── 5. Broadcast live position updates ─────────────────────────
+        // ── 5. Broadcast live position updates over WebSocket ───────────────────
         $broadcastPayload = [];
         foreach ($normalized as $record) {
-            $deviceId = $deviceMap[$record['ident']] ?? null;
+            $ident = (string) $record['ident'];
+            $deviceId = $deviceMap[$ident] ?? null;
             if (!$deviceId) {
                 continue;
             }
 
+            $recordedAt = isset($record['timestamp'])
+                ? Carbon::createFromTimestamp($record['timestamp'])->toIso8601String()
+                : $now->toIso8601String();
+
             $broadcastPayload[] = [
                 'device_id'       => $deviceId,
-                'ident'           => $record['ident'],
-                'name'            => $record['device_name'] ?? null,
-                'latitude'        => $record['position_latitude'] ?? 0,
-                'longitude'       => $record['position_longitude'] ?? 0,
+                'ident'           => $ident,
+                'name'            => $record['device_name'] ?? ($existingDevices->get($ident)?->name ?? 'Vehicle ' . substr($ident, -4)),
+                'latitude'        => $record['position_latitude'],
+                'longitude'       => $record['position_longitude'],
                 'speed'           => $record['position_speed'] ?? 0,
                 'direction'       => $record['position_direction'] ?? 0,
                 'altitude'        => $record['position_altitude'] ?? 0,
-                'engine_ignition' => $record['engine_ignition_status'] ?? false,
-                'movement_status' => $record['movement_status'] ?? false,
+                'engine_ignition' => (bool) ($record['engine_ignition_status'] ?? false),
+                'movement_status' => (bool) ($record['movement_status'] ?? false),
                 'battery_voltage' => $record['battery_voltage'] ?? $record['external_powersource_voltage'] ?? null,
-                'gsm_signal'      => isset($record['gsm_signal_level']) ? round(($record['gsm_signal_level'] / 100) * 5) : null,
+                'gsm_signal'      => $record['gsm_signal_bars'] ?? (isset($record['gsm_signal_level']) ? round(($record['gsm_signal_level'] / 100) * 5) : null),
                 'odometer'        => $record['vehicle_mileage'] ?? null,
-                'recorded_at'     => isset($record['timestamp'])
-                    ? Carbon::createFromTimestamp($record['timestamp'])->toIso8601String()
-                    : $now->toIso8601String(),
+                'recorded_at'     => $recordedAt,
             ];
         }
 
@@ -143,25 +179,9 @@ class ProcessGpsBatchJob implements ShouldQueue
             try {
                 broadcast(new VehiclePositionUpdated($broadcastPayload));
             } catch (\Throwable $e) {
-                // Broadcasting is best-effort — don't fail the job if Reverb is down
+                // Broadcasting is best-effort — don't fail the job if Reverb is temporarily down
                 report($e);
             }
         }
-    }
-
-    /**
-     * Flatten dot-notation keys into underscore-delimited keys.
-     *
-     * "position.latitude" → "position_latitude"
-     * "engine.ignition.status" → "engine_ignition_status"
-     */
-    private function normalize(array $raw): array
-    {
-        $normalized = [];
-        foreach ($raw as $key => $value) {
-            $normalized[str_replace('.', '_', $key)] = $value;
-        }
-
-        return $normalized;
     }
 }
